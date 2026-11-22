@@ -1,3 +1,4 @@
+
 import { Router } from "express";
 import { ObjectId } from "mongodb";
 import { getSessionUser } from "../lib/session.js";
@@ -45,8 +46,6 @@ async function uploadToImgBB(base64Input) {
   const json = await response.json().catch(() => null);
   const url = json?.data?.display_url || json?.data?.url;
   if (!response.ok || !json?.success || !url || !/^https:\/\//i.test(url)) {
-    // Surface the image host's own reason (never the API key) so the
-    // technician sees why the upload was rejected instead of a blank error.
     const reason = json?.error?.message;
     const err = new Error(
       reason
@@ -66,6 +65,7 @@ function toService(doc) {
     category: doc.category,
     categorySlug: doc.categorySlug,
     serviceMode: doc.serviceMode,
+    area: doc.area || "",
     price: doc.price,
     duration: doc.duration,
     description: doc.description,
@@ -89,7 +89,6 @@ export function createServicesRouter({ db, auth }) {
   const router = Router();
   const services = db.collection("services");
 
-  // GET /services — public callers only ever see approved + available listings.
   router.get("/services", async (req, res) => {
     try {
       const user = await getSessionUser(req, auth, db);
@@ -119,20 +118,16 @@ export function createServicesRouter({ db, auth }) {
           filter.isAvailable = isAvailable === "true";
         }
       } else if (isAdmin) {
-        // Admins may browse the full catalogue with explicit filters.
         if (approvalStatus) filter.approvalStatus = String(approvalStatus);
         if (technicianId) filter.technicianId = String(technicianId);
         if (isAvailable !== undefined && isAvailable !== "") {
           filter.isAvailable = isAvailable === "true";
         }
       } else {
-        // Public visibility rule: only approved + available services.
         filter.approvalStatus = "approved";
         filter.isAvailable = true;
       }
 
-      // Challenge 1: every search/filter clause is combined with $and and
-      // evaluated inside MongoDB — never post-filtered in application code.
       const andClauses = [];
       if (category) {
         andClauses.push({
@@ -176,7 +171,6 @@ export function createServicesRouter({ db, auth }) {
     }
   });
 
-  // GET /services/:id
   router.get("/services/:id", async (req, res) => {
     try {
       const { id } = req.params;
@@ -192,7 +186,8 @@ export function createServicesRouter({ db, auth }) {
       const user = await getSessionUser(req, auth, db);
       const isOwner = user && doc.technicianId === user.id;
       const isAdmin = user?.role === "admin";
-      const publiclyVisible = doc.approvalStatus === "approved" && doc.isAvailable !== false;
+      const publiclyVisible =
+        doc.approvalStatus === "approved" && doc.isAvailable !== false;
 
       if (!publiclyVisible && !isOwner && !isAdmin) {
         return res.status(404).json({ error: "Service not found." });
@@ -205,7 +200,6 @@ export function createServicesRouter({ db, auth }) {
     }
   });
 
-  // POST /services — technician submits a new listing (starts pending).
   router.post("/services", verifyToken, verifyTechnician, async (req, res) => {
     try {
       const user = req.user;
@@ -214,6 +208,7 @@ export function createServicesRouter({ db, auth }) {
         title,
         category,
         serviceMode,
+        area,
         price,
         duration,
         description,
@@ -244,6 +239,7 @@ export function createServicesRouter({ db, auth }) {
         category: CATEGORY_NAMES[categorySlug] ?? categorySlug,
         categorySlug,
         serviceMode: String(serviceMode),
+        area: area ? String(area).trim() : "",
         price: numericPrice,
         duration: duration ? String(duration) : "",
         description: String(description).trim(),
@@ -259,7 +255,9 @@ export function createServicesRouter({ db, auth }) {
       };
 
       const result = await services.insertOne(doc);
-      res.status(201).json({ service: toService({ ...doc, _id: result.insertedId }) });
+      res.status(201).json({
+        service: toService({ ...doc, _id: result.insertedId }),
+      });
     } catch (error) {
       console.error("POST /services failed:", error);
       res
@@ -268,7 +266,6 @@ export function createServicesRouter({ db, auth }) {
     }
   });
 
-  // PUT /services/:id — owner edit; approval resets to pending.
   router.put("/services/:id", verifyToken, async (req, res) => {
     try {
       const { id } = req.params;
@@ -284,8 +281,16 @@ export function createServicesRouter({ db, auth }) {
         return res.status(403).json({ error: "You can only edit your own services." });
       }
 
-      const { title, category, serviceMode, price, duration, description, imageBase64 } =
-        req.body || {};
+      const {
+        title,
+        category,
+        serviceMode,
+        area,
+        price,
+        duration,
+        description,
+        imageBase64,
+      } = req.body || {};
 
       const updates = { updatedAt: new Date() };
       if (title !== undefined) updates.title = String(title).trim();
@@ -295,6 +300,7 @@ export function createServicesRouter({ db, auth }) {
         updates.category = CATEGORY_NAMES[slug] ?? slug;
       }
       if (serviceMode !== undefined) updates.serviceMode = String(serviceMode);
+      if (area !== undefined) updates.area = String(area).trim();
       if (price !== undefined) {
         const numericPrice = Number(price);
         if (!Number.isFinite(numericPrice) || numericPrice < 0) {
@@ -306,7 +312,6 @@ export function createServicesRouter({ db, auth }) {
       if (description !== undefined) updates.description = String(description).trim();
       if (imageBase64) updates.image = await uploadToImgBB(imageBase64);
 
-      // Assignment rule: any edit resets approval to pending.
       updates.approvalStatus = "pending";
 
       await services.updateOne({ _id: new ObjectId(id) }, { $set: updates });
@@ -320,7 +325,6 @@ export function createServicesRouter({ db, auth }) {
     }
   });
 
-  // PATCH /services/:id — approval decisions / availability toggles.
   router.patch("/services/:id", verifyToken, async (req, res) => {
     try {
       const { id } = req.params;
@@ -341,7 +345,6 @@ export function createServicesRouter({ db, auth }) {
         if (!allowed.includes(approvalStatus)) {
           return res.status(400).json({ error: "Invalid approval status." });
         }
-        // Approval decisions are an admin action; ownership edits are not.
         if (user.role !== "admin") {
           return res.status(403).json({ error: "Only admins can change approval status." });
         }
@@ -370,7 +373,6 @@ export function createServicesRouter({ db, auth }) {
     }
   });
 
-  // DELETE /services/:id — owner or admin removes a listing.
   router.delete("/services/:id", verifyToken, async (req, res) => {
     try {
       const { id } = req.params;
